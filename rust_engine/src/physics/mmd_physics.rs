@@ -3,17 +3,29 @@
 //! 移植自 babylon-mmd，使用 Bullet3 引擎。
 //! 实现 commitBodyStates / syncBodies / stepSimulation / syncBones 全套流程。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use glam::{Mat3, Mat4, Vec3};
+use glam::{Mat3, Mat4, Quat, Vec3};
 
 use mmd::pmx::joint::Joint as PmxJoint;
 use mmd::pmx::rigid_body::RigidBody as PmxRigidBody;
 
-use super::bullet_ffi::{self, BulletWorld};
+use super::bullet_ffi::{
+    self, BulletConstraint, BulletRigidBody, BulletShape, BulletWorld, RigidBodyInfo,
+    BT_CONSTRAINT_STOP_ERP,
+};
 use super::config::{get_config, PhysicsConfig};
 use super::mmd_joint::MmdJointData;
 use super::mmd_rigid_body::{MmdRigidBodyData, PhysicsMode};
+
+const MAX_RAGDOLL_TERRAIN_BOXES: usize = 256;
+
+/// The body must be dropped before its collision shape. Neither is owned by
+/// BulletWorld; we detach the body before Rust drops either one.
+struct TerrainCollider {
+    body: BulletRigidBody,
+    _shape: BulletShape,
+}
 
 /// MMD 物理世界管理器（Bullet3 引擎）
 ///
@@ -25,6 +37,11 @@ pub struct MMDPhysics {
     joints: Vec<MmdJointData>,
     /// MMD 刚体数据列表
     pub rigid_bodies: Vec<MmdRigidBodyData>,
+    /// Emergency floor until Minecraft collision shapes have been sampled.
+    ragdoll_floor_body: Option<BulletRigidBody>,
+    ragdoll_floor_shape: Option<BulletShape>,
+    /// Snapshot of nearby Minecraft block collision boxes in PMX model space.
+    ragdoll_terrain: Vec<TerrainCollider>,
     /// Bullet3 物理世界
     world: BulletWorld,
     /// 物理 FPS
@@ -59,6 +76,9 @@ impl MMDPhysics {
         Some(Self {
             joints: Vec::new(),
             rigid_bodies: Vec::new(),
+            ragdoll_floor_body: None,
+            ragdoll_floor_shape: None,
+            ragdoll_terrain: Vec::new(),
             world,
             fps: config.physics_fps,
             max_substep_count: config.max_substep_count,
@@ -382,6 +402,222 @@ impl MMDPhysics {
         }
     }
 
+    /// Convert existing bone-following collision bodies into an articulated
+    /// ragdoll without restarting the secondary (hair/skirt/tail) simulation.
+    /// Call once after the last living animation frame has been evaluated.
+    pub fn start_ragdoll(
+        &mut self,
+        bone_parents: &[i32],
+        bone_transforms: &[Mat4],
+    ) -> bool {
+        let original_kinematic: Vec<(usize, usize)> = self
+            .rigid_bodies
+            .iter()
+            .enumerate()
+            .filter_map(|(rb_idx, rb)| {
+                let bone = usize::try_from(rb.bone_index).ok()?;
+                if rb.physics_mode == PhysicsMode::FollowBone
+                    && bone < bone_transforms.len()
+                    && rb.bullet_body.is_some()
+                {
+                    Some((rb_idx, bone))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Don't turn hair-only models into free-floating physics objects.
+        if original_kinematic.len() < 3 {
+            return false;
+        }
+
+        // Snap the kinematic bodies to the exact death pose before changing
+        // their collision and mass flags. The original PMX may set mass=0.
+        for &(rb_idx, bone_idx) in &original_kinematic {
+            let rb = &self.rigid_bodies[rb_idx];
+            if let Some(ref body) = rb.bullet_body {
+                let bone_left = super::inv_z(bone_transforms[bone_idx]);
+                body.set_transform(rb.compute_body_matrix(bone_left));
+            }
+        }
+
+        // Re-register bodies to refresh Bullet's broadphase classification.
+        // Collision bit 15 is reserved for the prototype floor.
+        for rb in &mut self.rigid_bodies {
+            let Some(ref body) = rb.bullet_body else { continue };
+            self.world.remove_rigid_body(body);
+            if rb.physics_mode == PhysicsMode::FollowBone
+                && rb.bone_index >= 0
+                && (rb.bone_index as usize) < bone_transforms.len()
+            {
+                body.set_kinematic(false);
+                body.set_mass(rb.mass.max(0.75));
+                body.set_damping(0.12, 0.35);
+                body.clear_forces();
+                rb.physics_mode = PhysicsMode::Physics;
+                self.dynamic_bone_indices.insert(rb.bone_index as usize);
+            }
+            let group = 1i32 << rb.group.min(15);
+            self.world
+                .add_rigid_body(body, group, (rb.group_mask | 0x8000) as i32);
+        }
+
+        // Build anatomical joints from the PMX bone hierarchy. Standard PMX
+        // models typically have spring constraints for clothing, but none for
+        // the kinematic torso, limbs and head.
+        let by_bone: HashMap<usize, usize> = original_kinematic
+            .iter()
+            .map(|&(rb_idx, bone_idx)| (bone_idx, rb_idx))
+            .collect();
+        let mut added = 0usize;
+        for &(child_rb_idx, child_bone_idx) in &original_kinematic {
+            let Some(parent_rb_idx) =
+                nearest_ragdoll_parent(child_bone_idx, bone_parents, &by_bone)
+            else {
+                continue;
+            };
+
+            if self.joints.iter().any(|joint| {
+                (joint.rigid_body_a_index == parent_rb_idx as i32
+                    && joint.rigid_body_b_index == child_rb_idx as i32)
+                    || (joint.rigid_body_a_index == child_rb_idx as i32
+                        && joint.rigid_body_b_index == parent_rb_idx as i32)
+            }) {
+                continue;
+            }
+
+            let parent = self.rigid_bodies[parent_rb_idx].bullet_body.as_ref().unwrap();
+            let child = self.rigid_bodies[child_rb_idx].bullet_body.as_ref().unwrap();
+            let pivot = super::inv_z(bone_transforms[child_bone_idx]);
+            // Joint frames must be relative to the *current* death-pose
+            // bodies, not PMX's bind-pose rigid-body transforms.
+            let frame_a = parent.get_transform().inverse() * pivot;
+            let frame_b = child.get_transform().inverse() * pivot;
+            if let Some(constraint) =
+                BulletConstraint::new_6dof_spring(parent, child, frame_a, frame_b, true)
+            {
+                constraint.set_linear_lower_limit(0.0, 0.0, 0.0);
+                constraint.set_linear_upper_limit(0.0, 0.0, 0.0);
+                constraint.set_angular_lower_limit(-0.95, -0.95, -0.95);
+                constraint.set_angular_upper_limit(0.95, 0.95, 0.95);
+                for axis in 0..6 {
+                    constraint.set_param(BT_CONSTRAINT_STOP_ERP, 0.475, axis);
+                }
+                self.world.add_constraint(&constraint, true);
+                self.joints.push(MmdJointData {
+                    name: format!("ragdoll_{}", child_bone_idx),
+                    rigid_body_a_index: parent_rb_idx as i32,
+                    rigid_body_b_index: child_rb_idx as i32,
+                    constraint: Some(constraint),
+                });
+                added += 1;
+            }
+        }
+
+        if let Some(shape) = BulletShape::r#box(32.0, 0.5, 32.0) {
+            let info = RigidBodyInfo {
+                mass: 0.0,
+                linear_damping: 0.0,
+                angular_damping: 0.0,
+                friction: 0.85,
+                restitution: 0.0,
+                additional_damping: false,
+                is_kinematic: false,
+                disable_deactivation: true,
+                no_contact_response: false,
+                initial_transform: Mat4::from_translation(Vec3::new(0.0, -0.5, 0.0)),
+            };
+            if let Some(floor) = BulletRigidBody::new(&info, &shape) {
+                self.world.add_rigid_body(&floor, 0x8000, -1);
+                self.ragdoll_floor_body = Some(floor);
+                self.ragdoll_floor_shape = Some(shape);
+            }
+        }
+
+        self.prev_model_position = None;
+        log::info!(
+            "[MMD ragdoll] {} core bodies dynamic, {} anatomical constraints, floor={}",
+            original_kinematic.len(), added, self.ragdoll_floor_body.is_some()
+        );
+        true
+    }
+
+    /// Replace the temporary flat floor with real Minecraft collision boxes.
+    /// Every input box uses Minecraft units *relative to the entity feet*:
+    /// [minX,minY,minZ,maxX,maxY,maxZ]. The local physics scene is mirrored
+    /// along Z relative to rendering, then inverse-yawed and divided by the
+    /// effective PMX scale (Minecraft blocks per PMX model unit).
+    pub fn set_ragdoll_terrain(
+        &mut self,
+        relative_boxes: &[f32],
+        body_yaw_radians: f32,
+        model_scale: f32,
+    ) -> bool {
+        if relative_boxes.len() % 6 != 0
+            || relative_boxes.len() > MAX_RAGDOLL_TERRAIN_BOXES * 6
+            || !body_yaw_radians.is_finite()
+            || !model_scale.is_finite()
+            || model_scale <= 0.0001
+        {
+            return false;
+        }
+
+        // Allocate everything first. On native allocation failure, keep the
+        // existing emergency floor rather than leaving the ragdoll unsupported.
+        let mut new_terrain = Vec::with_capacity(relative_boxes.len() / 6);
+        for bounds in relative_boxes.chunks_exact(6) {
+            let Some((half_extents, transform)) =
+                terrain_box_pose(bounds, body_yaw_radians, model_scale)
+            else {
+                return false;
+            };
+            let Some(shape) = BulletShape::r#box(
+                half_extents.x, half_extents.y, half_extents.z,
+            ) else {
+                return false;
+            };
+            let info = RigidBodyInfo {
+                mass: 0.0,
+                linear_damping: 0.0,
+                angular_damping: 0.0,
+                friction: 0.85,
+                restitution: 0.0,
+                additional_damping: false,
+                is_kinematic: false,
+                disable_deactivation: true,
+                no_contact_response: false,
+                initial_transform: transform,
+            };
+            let Some(body) = BulletRigidBody::new(&info, &shape) else {
+                return false;
+            };
+            new_terrain.push(TerrainCollider { body, _shape: shape });
+        }
+
+        self.clear_terrain();
+        if let Some(floor) = self.ragdoll_floor_body.take() {
+            self.world.remove_rigid_body(&floor);
+        }
+        self.ragdoll_floor_shape = None;
+        for terrain in &new_terrain {
+            self.world.add_rigid_body(&terrain.body, 0x8000, -1);
+        }
+        self.ragdoll_terrain = new_terrain;
+
+        log::info!(
+            "[MMD ragdoll] Minecraft terrain collision installed: {} boxes",
+            self.ragdoll_terrain.len()
+        );
+        true
+    }
+
+    fn clear_terrain(&mut self) {
+        for collider in self.ragdoll_terrain.drain(..) {
+            self.world.remove_rigid_body(&collider.body);
+        }
+    }
+
     /// 重置物理系统
     pub fn reset(&mut self) {
         self.prev_model_position = None;
@@ -402,6 +638,10 @@ impl MMDPhysics {
 
     pub fn rigid_body_count(&self) -> usize {
         self.rigid_bodies.len()
+    }
+    #[cfg(test)]
+    pub fn ragdoll_terrain_count(&self) -> usize {
+        self.ragdoll_terrain.len()
     }
     pub fn joint_count(&self) -> usize {
         self.joints.len()
@@ -471,6 +711,10 @@ impl Drop for MMDPhysics {
                 self.world.remove_rigid_body(body);
             }
         }
+        if let Some(ref floor) = self.ragdoll_floor_body {
+            self.world.remove_rigid_body(floor);
+        }
+        self.clear_terrain();
         // 之后 Rust 自动 drop 各字段（约束/刚体/世界），此时世界已为空，安全释放
 
         // 泄漏检测日志（仅在当前实例释放后检查全局计数）
@@ -482,5 +726,134 @@ impl Drop for MMDPhysics {
                 stats.constraints, stats.motion_states
             );
         }
+    }
+}
+
+/// Translate Minecraft world-space AABB coordinates into Bullet model-local
+/// coordinates. The box is yawed about its center to preserve stair/slab/wall
+/// geometry rather than taking a loose rotated AABB.
+fn terrain_box_pose(bounds: &[f32], yaw: f32, scale: f32) -> Option<(Vec3, Mat4)> {
+    if bounds.len() != 6 || !yaw.is_finite() || !scale.is_finite() || scale <= 0.0001
+        || bounds.iter().any(|v| !v.is_finite())
+    {
+        return None;
+    }
+    let min = Vec3::from_slice(&bounds[0..3]);
+    let max = Vec3::from_slice(&bounds[3..6]);
+    let half = (max - min) * (0.5 / scale);
+    if half.min_element() < 0.0001 || half.max_element() > 1024.0 {
+        return None;
+    }
+
+    let center = (min + max) * (0.5 / scale);
+    let (sin, cos) = yaw.sin_cos();
+    let physics_center = Vec3::new(
+        cos * center.x + sin * center.z,
+        center.y,
+        sin * center.x - cos * center.z,
+    );
+    let transform = Mat4::from_rotation_translation(
+        Quat::from_rotation_y(-yaw),
+        physics_center,
+    );
+    Some((half, transform))
+}
+
+/// Walk the PMX hierarchy, ignoring intermediary bones with no collision body.
+fn nearest_ragdoll_parent(
+    child_bone: usize,
+    parents: &[i32],
+    bodies_by_bone: &HashMap<usize, usize>,
+) -> Option<usize> {
+    let mut current = child_bone;
+    for _ in 0..parents.len() {
+        let parent = usize::try_from(*parents.get(current)?).ok()?;
+        if parent == current || parent >= parents.len() {
+            return None;
+        }
+        if let Some(&body_idx) = bodies_by_bone.get(&parent) {
+            return Some(body_idx);
+        }
+        current = parent;
+    }
+    None
+}
+
+#[cfg(test)]
+mod ragdoll_tests {
+    use super::*;
+
+    #[test]
+    fn minecraft_boxes_mirror_z_and_rotate_with_entity_yaw() {
+        let (half, pose) = terrain_box_pose(&[0.0, 0.0, 1.0, 2.0, 1.0, 3.0], 0.0, 0.5)
+            .expect("valid collision box");
+        assert!((half - Vec3::new(2.0, 1.0, 2.0)).length() < 0.0001);
+        assert!((pose.w_axis.truncate() - Vec3::new(2.0, 1.0, -4.0)).length() < 0.0001);
+
+        let (_, rotated) = terrain_box_pose(
+            &[0.0, 0.0, 1.0, 2.0, 1.0, 3.0],
+            std::f32::consts::FRAC_PI_2,
+            0.5,
+        )
+        .expect("valid rotated collision box");
+        assert!((rotated.w_axis.truncate() - Vec3::new(4.0, 1.0, 2.0)).length() < 0.0001);
+
+        assert!(terrain_box_pose(&[0.0, 0.0, 0.0, 1.0, 0.0, 1.0], 0.0, 1.0).is_none());
+        assert!(terrain_box_pose(&[0.0, 0.0, 0.0, 1.0, 1.0, 1.0], f32::NAN, 1.0).is_none());
+    }
+
+    #[test]
+    fn bullet_ragdoll_terrain_stops_a_falling_rigid_body() {
+        let mut physics = MMDPhysics::new().expect("Bullet world");
+        assert!(physics.set_ragdoll_terrain(&[-2.0, -1.0, -2.0, 2.0, 0.0, 2.0], 0.0, 1.0));
+        assert_eq!(physics.ragdoll_terrain.len(), 1);
+        assert!(physics.ragdoll_floor_body.is_none());
+
+        let shape = BulletShape::sphere(0.5).expect("sphere");
+        let ball = BulletRigidBody::new(
+            &RigidBodyInfo {
+                mass: 1.0,
+                linear_damping: 0.0,
+                angular_damping: 0.0,
+                friction: 0.8,
+                restitution: 0.0,
+                additional_damping: false,
+                is_kinematic: false,
+                disable_deactivation: true,
+                no_contact_response: false,
+                initial_transform: Mat4::from_translation(Vec3::new(0.0, 4.0, 0.0)),
+            },
+            &shape,
+        )
+        .expect("dynamic body");
+        physics.world.add_rigid_body(&ball, 1, -1);
+        for _ in 0..180 {
+            physics.world.step(1.0 / 60.0, 4, 1.0 / 60.0);
+        }
+        let pos = ball.get_position();
+        assert!(pos.is_finite() && pos.y > 0.35 && pos.y < 0.9,
+            "ball fell through a Minecraft ground box: {:?}", pos);
+
+        physics.world.remove_rigid_body(&ball);
+        drop(ball);
+        drop(shape);
+        // No colliders means actual open air or void: remove the prototype floor.
+        assert!(physics.set_ragdoll_terrain(&[], 0.0, 1.0));
+        assert!(physics.ragdoll_terrain.is_empty());
+    }
+
+    #[test]
+    fn nearest_parent_skips_non_collision_bones() {
+        let parents = [-1, 0, 1, 2, 1];
+        let by_bone = HashMap::from([(0, 5), (2, 8)]);
+        assert_eq!(nearest_ragdoll_parent(3, &parents, &by_bone), Some(8));
+        assert_eq!(nearest_ragdoll_parent(4, &parents, &by_bone), Some(5));
+        assert_eq!(nearest_ragdoll_parent(0, &parents, &by_bone), None);
+    }
+
+    #[test]
+    fn malformed_parent_cycle_cannot_hang() {
+        let parents = [1, 0, -1];
+        assert_eq!(nearest_ragdoll_parent(0, &parents, &HashMap::new()), None);
     }
 }

@@ -136,6 +136,7 @@ mod ffi {
         pub fn bw_rigid_body_set_activation_state(rb: *mut BW_RigidBody, state: c_int);
         pub fn bw_rigid_body_force_activation_state(rb: *mut BW_RigidBody, state: c_int);
         pub fn bw_rigid_body_set_kinematic(rb: *mut BW_RigidBody, kinematic: bool);
+        pub fn bw_rigid_body_set_mass(rb: *mut BW_RigidBody, mass: c_float);
         pub fn bw_rigid_body_get_mass(rb: *mut BW_RigidBody) -> c_float;
         pub fn bw_rigid_body_clear_forces(rb: *mut BW_RigidBody);
         pub fn bw_rigid_body_apply_central_force(
@@ -405,6 +406,10 @@ impl BulletRigidBody {
 
     pub fn set_kinematic(&self, kinematic: bool) {
         unsafe { ffi::bw_rigid_body_set_kinematic(self.ptr, kinematic) }
+    }
+
+    pub fn set_mass(&self, mass: f32) {
+        unsafe { ffi::bw_rigid_body_set_mass(self.ptr, mass) }
     }
 
     pub fn get_mass(&self) -> f32 {

@@ -131,6 +131,8 @@ pub struct MmdModel {
     // 物理系统
     physics: Option<MMDPhysics>,
     physics_enabled: bool,
+    /// Death replaces normal animation with articulated Bullet simulation.
+    ragdoll_active: bool,
     /// 骨骼变换缓冲区（避免每帧堆分配）
     physics_bone_transforms_buf: Vec<Mat4>,
 
@@ -289,6 +291,7 @@ impl MmdModel {
             model_transform: Mat4::IDENTITY,
             physics: None,
             physics_enabled: false,
+            ragdoll_active: false,
             physics_bone_transforms_buf: Vec::new(),
             material_visible: Vec::new(),
             user_material_visible: Vec::new(),
@@ -2277,6 +2280,18 @@ impl MmdModel {
 
     /// 初始化物理系统（Bullet3）
     fn tick_animation_internal(&mut self, elapsed: f32, cpu_skinning: bool) {
+        // Preserve the final living pose. Re-evaluating VMD animation here
+        // would fight Bullet's new body transforms every frame.
+        if self.ragdoll_active {
+            self.update_physics(elapsed);
+            self.end_physics_update();
+            self.end_animation();
+            if cpu_skinning {
+                self.update();
+            }
+            return;
+        }
+
         self.with_vrm_runtime_state(|model, runtime_state| {
             runtime_state.apply_inputs(model);
         });
@@ -2396,11 +2411,73 @@ impl MmdModel {
 
         self.physics = Some(physics);
         self.physics_enabled = true;
+        self.ragdoll_active = false;
         true
+    }
+
+    /// Switch an MMD humanoid into a Bullet-driven death ragdoll. This is
+    /// deliberately model-local: Physics Mod can keep handling vanilla mobs.
+    pub fn start_ragdoll(&mut self) -> bool {
+        if self.ragdoll_active {
+            return true;
+        }
+        if self.is_vrm {
+            return false;
+        }
+        if self.physics.is_none() && !self.init_physics() {
+            return false;
+        }
+
+        let bone_count = self.bone_manager.bone_count();
+        let parents: Vec<i32> = (0..bone_count)
+            .map(|i| self.bone_manager.get_bone(i).map_or(-1, |bone| bone.parent_index))
+            .collect();
+        let transforms: Vec<Mat4> = (0..bone_count)
+            .map(|i| self.bone_manager.get_global_transform(i))
+            .collect();
+
+        let started = self.physics.as_mut().is_some_and(|physics| {
+            physics.start_ragdoll(&parents, &transforms)
+        });
+        if started {
+            self.ragdoll_active = true;
+            self.physics_enabled = true;
+            self.is_transitioning = false;
+            self.transition_matrices.clear();
+        }
+        started
+    }
+
+    /// Install a bounded snapshot of Minecraft block collision shapes into
+    /// this ragdoll's own Bullet world, replacing the initial safety floor.
+    pub fn set_ragdoll_terrain(
+        &mut self,
+        relative_boxes: &[f32],
+        body_yaw_radians: f32,
+        model_scale: f32,
+    ) -> bool {
+        self.ragdoll_active
+            && self.physics.as_mut().is_some_and(|physics| {
+                physics.set_ragdoll_terrain(relative_boxes, body_yaw_radians, model_scale)
+            })
     }
 
     /// 重置物理系统
     pub fn reset_physics(&mut self) {
+        if self.ragdoll_active {
+            // A player can respawn with the same cached model instance.
+            // Restore the animated (kinematic) skeleton and remove the
+            // temporary ragdoll joints/floor before normal playback resumes.
+            self.physics = None;
+            self.ragdoll_active = false;
+            self.bone_manager.clear_physics_bone_indices();
+            self.bone_manager.reset_all_transforms();
+            self.bone_manager.update_transforms(false);
+            self.bone_manager.update_transforms(true);
+            self.bone_manager.end_update();
+            self.init_physics();
+            return;
+        }
         if let Some(ref mut physics) = self.physics {
             physics.reset();
         }
@@ -2408,7 +2485,7 @@ impl MmdModel {
 
     /// 启用/禁用物理
     pub fn set_physics_enabled(&mut self, enabled: bool) {
-        self.physics_enabled = enabled;
+        self.physics_enabled = enabled || self.ragdoll_active;
     }
 
     /// 获取物理是否启用
@@ -2906,6 +2983,74 @@ mod tests {
     use crate::vrm_runtime::{ArmIkHandCalibration, BodyTrackingCalibration};
     use std::hint::black_box;
     use std::time::{Duration, Instant};
+
+    /// Optional end-to-end smoke test. Set MMD_RAGDOLL_TEST_MODEL to a PMX
+    /// you own; no third-party character assets are checked into this fork.
+    #[test]
+    fn ragdoll_smoke_with_external_humanoid_pmx() {
+        let Ok(path) = std::env::var("MMD_RAGDOLL_TEST_MODEL") else {
+            return;
+        };
+        let mut model = crate::model::load_pmx(path).expect("external PMX must load");
+        assert!(model.init_physics(), "PMX needs rigid bodies");
+        let before = model.physics.as_ref().unwrap().joint_count();
+        let kinetic_before = model
+            .physics
+            .as_ref()
+            .unwrap()
+            .rigid_bodies
+            .iter()
+            .filter(|rb| rb.physics_mode == crate::physics::PhysicsMode::FollowBone)
+            .count();
+        assert!(kinetic_before >= 3);
+        let initial_positions: Vec<(usize, Vec3)> = model.physics.as_ref().unwrap()
+            .rigid_bodies.iter().enumerate().filter_map(|(idx, rb)| {
+                (rb.physics_mode == crate::physics::PhysicsMode::FollowBone)
+                    .then(|| rb.bullet_body.as_ref().map(|body| body.get_position()))
+                    .flatten()
+                    .map(|position| (idx, position))
+            }).collect();
+        assert!(model.start_ragdoll());
+        assert!(model.set_ragdoll_terrain(
+            &[-3.0, -1.0, -3.0, 3.0, 0.0, 3.0],
+            0.35,
+            0.09,
+        ));
+        assert_eq!(model.physics.as_ref().unwrap().ragdoll_terrain_count(), 1);
+        let physics = model.physics.as_ref().unwrap();
+        let kinetic_after = physics
+            .rigid_bodies
+            .iter()
+            .filter(|rb| rb.physics_mode == crate::physics::PhysicsMode::FollowBone)
+            .count();
+        assert!(kinetic_after < kinetic_before);
+        assert!(physics.joint_count() > before);
+        println!("PMX ragdoll: {} anatomical bodies, {} new joints", kinetic_before,
+            physics.joint_count() - before);
+        for _ in 0..40 {
+            model.tick_animation(1.0 / 60.0);
+        }
+        let moved = initial_positions.iter().any(|(index, original)| {
+            model.physics.as_ref().unwrap().rigid_bodies[*index]
+                .bullet_body.as_ref().is_some_and(|body| {
+                    original.distance(body.get_position()) > 0.1
+                })
+        });
+        assert!(moved, "rigid bodies must actually move after death");
+        for bone_index in model.physics.as_ref().unwrap().get_dynamic_bone_indices() {
+            let p = model.bone_manager.get_global_transform(*bone_index).w_axis;
+            assert!(p.is_finite(), "ragdoll bone position became NaN");
+        }
+        model.reset_physics();
+        assert!(!model.ragdoll_active, "respawn must clear the ragdoll state");
+        assert_eq!(
+            model.physics.as_ref().unwrap().rigid_bodies.iter()
+                .filter(|rb| rb.physics_mode == crate::physics::PhysicsMode::FollowBone)
+                .count(),
+            kinetic_before,
+            "respawn must restore the PMX kinematic body topology"
+        );
+    }
 
     const PROFILE_VERTEX_COUNT: usize = 120_000;
     const PROFILE_BONE_COUNT: usize = 128;

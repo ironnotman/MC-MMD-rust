@@ -181,6 +181,13 @@ public class NativeFunc {
 
     public native boolean InitPhysics(long model);
 
+    /** Turn a dying PMX humanoid into a Bullet-driven articulated ragdoll. */
+    public native boolean StartRagdoll(long model);
+
+    /** Relative Minecraft block AABBs in groups of six floats: minXYZ/maxXYZ. */
+    public native boolean SetRagdollTerrain(long model, float[] relativeBoxes,
+                                            float yawRadians, float blockScale);
+
     public native void ResetPhysics(long model);
 
     public native void SetPhysicsEnabled(long model, boolean enabled);

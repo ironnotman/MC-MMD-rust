@@ -1,6 +1,7 @@
 package com.shiroha.mmdskin.renderer.integration.player;
 
 import com.mojang.blaze3d.vertex.PoseStack;
+import com.shiroha.mmdskin.renderer.integration.DetachedRagdollRegistry;
 import com.shiroha.mmdskin.renderer.runtime.model.MMDModelManager;
 import com.shiroha.mmdskin.scene.client.SceneModelManager;
 import net.minecraft.client.Minecraft;
@@ -25,6 +26,9 @@ public final class PlayerMixinDelegate {
             AbstractClientPlayer player, float entityYaw, float tickDelta,
             PoseStack matrixStack, MultiBufferSource vertexConsumers, int packedLight,
             boolean isYsmActive) {
+        if (player.getHealth() <= 0.0f && DetachedRagdollRegistry.isCaptured(player)) {
+            return RenderAction.CANCEL;
+        }
         PlayerRenderSelection selection = PlayerRenderSelectionResolver.resolve(player, isYsmActive);
         if (selection.hasTerminalAction()) {
             return selection.terminalAction();

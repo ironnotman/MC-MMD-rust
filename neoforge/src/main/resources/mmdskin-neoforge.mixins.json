@@ -8,6 +8,7 @@
   "client": [
     "NeoForgePlayerRendererMixin",
     "MobReplacementLivingEntityRendererMixin",
+    "compat.PhysicsModDeathMixin",
     "compat.VivecraftVRArmHelperMixin",
     "compat.VivecraftVRPlayerRendererMixin",
     "CameraMixin",

@@ -6,6 +6,7 @@ import com.mojang.blaze3d.vertex.PoseStack;
 import com.shiroha.mmdskin.renderer.api.RenderContext;
 import com.shiroha.mmdskin.renderer.api.RenderParams;
 import com.shiroha.mmdskin.renderer.integration.ModelPropertyHelper;
+import com.shiroha.mmdskin.renderer.integration.DetachedRagdollRegistry;
 import com.shiroha.mmdskin.renderer.integration.player.PlayerPerformanceGate;
 import com.shiroha.mmdskin.renderer.runtime.model.MMDModelManager;
 import net.minecraft.client.renderer.GameRenderer;
@@ -21,6 +22,9 @@ public final class MobReplacementRenderer {
     }
 
     public static boolean render(LivingEntity entity, float entityYaw, float tickDelta, PoseStack poseStack, int packedLight) {
+        // The detached world renderer owns this corpse; suppress the live
+        // replacement pass and the original vanilla entity model.
+        if (DetachedRagdollRegistry.isCaptured(entity)) return true;
         String modelName = MobReplacementService.getReplacementModelName(entity);
         if (modelName == null || !PlayerPerformanceGate.allowsMobReplacement(entity)) {
             return false;

@@ -4,10 +4,12 @@ package com.shiroha.mmdskin.neoforge;
 import com.shiroha.mmdskin.MmdSkin;
 import com.shiroha.mmdskin.MmdSkinClient;
 import com.shiroha.mmdskin.config.ConfigManager;
+import com.shiroha.mmdskin.neoforge.compat.DetachedRagdollRenderHooks;
 import com.shiroha.mmdskin.neoforge.config.MmdSkinConfig;
 import com.shiroha.mmdskin.neoforge.maid.MaidRenderEventHandler;
 import com.shiroha.mmdskin.neoforge.maid.MaidSyncEventHandler;
 import com.shiroha.mmdskin.neoforge.register.MmdSkinRegisterClient;
+import com.shiroha.mmdskin.renderer.integration.DetachedRagdollRegistry;
 import com.shiroha.mmdskin.renderer.runtime.model.opengl.MMDModelOpenGL;
 import net.neoforged.api.distmarker.Dist;
 import net.neoforged.bus.api.SubscribeEvent;
@@ -35,6 +37,8 @@ public final class MmdSkinNeoForgeClient {
         MmdSkinClient.initClient();
         MmdSkinRegisterClient.Register();
         MMDModelOpenGL.isMMDShaderEnabled = ConfigManager.isMMDShaderEnabled();
+        DetachedRagdollRegistry.enableForNeoForgeClient();
+        NeoForge.EVENT_BUS.register(new DetachedRagdollRenderHooks());
         NeoForge.EVENT_BUS.register(new MaidRenderEventHandler());
         NeoForge.EVENT_BUS.register(MaidSyncEventHandler.class);
     }

@@ -5,6 +5,7 @@ import com.shiroha.mmdskin.MmdSkin;
 import com.shiroha.mmdskin.renderer.api.RenderContext;
 import com.shiroha.mmdskin.renderer.api.RenderParams;
 import com.shiroha.mmdskin.renderer.integration.ModelPropertyHelper;
+import com.shiroha.mmdskin.renderer.integration.DetachedRagdollRegistry;
 import com.shiroha.mmdskin.renderer.runtime.model.MMDModelManager;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vertex.PoseStack;
@@ -43,6 +44,9 @@ public class MmdSkinRenderer<T extends Entity> extends EntityRenderer<T> {
     public void render(T entityIn, float entityYaw, float tickDelta, PoseStack matrixStackIn,
                        MultiBufferSource bufferIn, int packedLightIn) {
         super.render(entityIn, entityYaw, tickDelta, matrixStackIn, bufferIn, packedLightIn);
+        if (entityIn instanceof LivingEntity living && DetachedRagdollRegistry.isCaptured(living)) {
+            return;
+        }
         MMDModelManager.Model model = MMDModelManager.GetModel(modelName, entityIn.getStringUUID());
         if (model == null) return;
 

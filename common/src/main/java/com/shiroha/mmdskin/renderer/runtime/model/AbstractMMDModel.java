@@ -195,6 +195,21 @@ public abstract class AbstractMMDModel implements IMMDModel {
         }
     }
 
+    /** Advance an MMD ragdoll whose original Minecraft entity is gone. */
+    public final void tickDetachedRagdoll() {
+        if (model == 0 || !isReady()) return;
+        applyPhysicsState(ConfigManager.isPhysicsEnabled());
+        update();
+    }
+
+    /** Render the preserved Bullet pose without the live-entity LOD gate. */
+    public final void renderDetachedRagdoll(LivingEntity originalEntity, float bodyYaw,
+                                            PoseStack poseStack, int packedLight) {
+        if (model == 0 || !isReady()) return;
+        doRenderModel(originalEntity, bodyYaw, 0.0f,
+                new Vector3f(0.0f), poseStack, packedLight);
+    }
+
     protected long getNativeUpdateRevision() {
         return nativeUpdateRevision.get();
     }

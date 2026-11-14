@@ -1797,6 +1797,56 @@ pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_InitPhysics(
     0
 }
 
+/// Start a one-way death ragdoll for PMX models. Returns false if the PMX
+/// lacks enough bone-following collision bodies for an articulated skeleton.
+#[no_mangle]
+pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_StartRagdoll(
+    _env: JNIEnv,
+    _class: JClass,
+    model: jlong,
+) -> jboolean {
+    let models = MODELS.read().unwrap();
+    if let Some(model_arc) = models.get(&model) {
+        let mut model = model_arc.lock().unwrap();
+        if model.start_ragdoll() {
+            return 1;
+        }
+    }
+    0
+}
+
+/// Minecraft block collision AABBs, relative to the dying entity's feet.
+/// The Java client snapshots loaded blocks and bounds the payload to 256 boxes.
+#[no_mangle]
+pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_SetRagdollTerrain(
+    env: JNIEnv,
+    _class: JClass,
+    model: jlong,
+    relative_boxes: jni::objects::JFloatArray,
+    body_yaw_radians: jfloat,
+    model_scale: jfloat,
+) -> jboolean {
+    let Ok(len) = env.get_array_length(&relative_boxes) else {
+        return 0;
+    };
+    if len < 0 || len as usize > 256 * 6 || len % 6 != 0 {
+        return 0;
+    }
+    let mut values = vec![0.0f32; len as usize];
+    if env.get_float_array_region(&relative_boxes, 0, &mut values).is_err() {
+        return 0;
+    }
+
+    let models = MODELS.read().unwrap();
+    if let Some(model_arc) = models.get(&model) {
+        let mut model = model_arc.lock().unwrap();
+        if model.set_ragdoll_terrain(&values, body_yaw_radians, model_scale) {
+            return 1;
+        }
+    }
+    0
+}
+
 /// 重置物理系统
 #[no_mangle]
 pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_ResetPhysics(

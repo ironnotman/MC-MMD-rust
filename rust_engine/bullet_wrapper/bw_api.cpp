@@ -391,6 +391,21 @@ void bw_rigid_body_set_kinematic(BW_RigidBody* rb, bool kinematic) {
     body->setActivationState(DISABLE_DEACTIVATION);
 }
 
+// Kinematic bodies are constructed with zero mass. Clearing their kinematic
+// flag alone would leave them static, so restore mass and shape inertia too.
+void bw_rigid_body_set_mass(BW_RigidBody* rb, float mass) {
+    if (!rb) return;
+    btRigidBody* body = (btRigidBody*)rb;
+    const float safeMass = mass > 0.0f ? mass : 0.0f;
+    btVector3 inertia(0, 0, 0);
+    if (safeMass > 0.0f && body->getCollisionShape()) {
+        body->getCollisionShape()->calculateLocalInertia(safeMass, inertia);
+    }
+    body->setMassProps(safeMass, inertia);
+    body->updateInertiaTensor();
+    body->activate(true);
+}
+
 float bw_rigid_body_get_mass(BW_RigidBody* rb) {
     if (!rb) return 0.0f;
     btRigidBody* body = (btRigidBody*)rb;

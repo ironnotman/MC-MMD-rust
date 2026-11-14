@@ -50,7 +50,7 @@ final class PlayerModelRenderCoordinator {
         boolean isFirstPerson = !isVr && selection.isLocalPlayer() && FirstPersonManager.isActive();
 
         if (!isVr) {
-            AnimationStateManager.updateAnimationState(player, modelData);
+            AnimationStateManager.updateAnimationState(player, modelData, tickDelta);
         }
         consumePendingSignals(player, modelData, selection.isLocalPlayer());
 

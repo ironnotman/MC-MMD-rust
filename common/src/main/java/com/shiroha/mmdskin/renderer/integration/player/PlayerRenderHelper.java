@@ -21,6 +21,12 @@ public final class PlayerRenderHelper {
         params.bodyPitch = 0.0f;
         params.translation = new Vector3f(0.0f);
 
+        // Bullet already rotates the deceased PMX skeleton. Do not stack
+        // swim/crawl/sleep whole-model rotations on top of its ragdoll pose.
+        if (player.getHealth() <= 0.0f) {
+            return params;
+        }
+
         if (player.isFallFlying()) {
             params.bodyPitch = player.getXRot() + getPropertyFloat(modelData, "flyingPitch", 0.0f);
             params.translation = getPropertyVector(modelData, "flyingTrans");

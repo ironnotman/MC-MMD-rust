@@ -1,5 +1,8 @@
 package com.shiroha.mmdskin.renderer.integration.entity;
 
+import com.shiroha.mmdskin.NativeFunc;
+import com.shiroha.mmdskin.renderer.integration.DetachedRagdollRegistry;
+import com.shiroha.mmdskin.renderer.integration.RagdollTerrainBridge;
 import com.shiroha.mmdskin.renderer.runtime.animation.MMDAnimManager;
 import com.shiroha.mmdskin.player.runtime.EntityAnimState;
 import com.shiroha.mmdskin.renderer.api.RenderParams;
@@ -31,8 +34,25 @@ public final class EntityAnimationResolver {
 
         if (entity instanceof LivingEntity living) {
             if (living.getHealth() <= 0.0f) {
-                changeAnimOnce(model, EntityAnimState.State.Die, 0);
+                // Exactly once per entity. Avoid starting the default VMD
+                // death pose after the Rust engine has taken over its bones.
+                if (model.entityData.stateLayers[0] != EntityAnimState.State.Die) {
+                    model.entityData.stateLayers[0] = EntityAnimState.State.Die;
+                    boolean ragdollStarted = NativeFunc.GetInst()
+                            .StartRagdoll(model.model.getModelHandle());
+                    if (ragdollStarted) {
+                        RagdollTerrainBridge.install(living, model, params.bodyYaw, tickDelta);
+                        DetachedRagdollRegistry.capture(living, model, params.bodyYaw);
+                    } else {
+                        model.model.changeAnim(
+                                MMDAnimManager.GetAnimModel(model.model, "die"), 0);
+                    }
+                }
                 return;
+            }
+            if (model.entityData.stateLayers[0] == EntityAnimState.State.Die) {
+                model.model.resetPhysics();
+                model.entityData.invalidateStateLayers();
             }
             if (living.isSleeping()) {
                 params.bodyYaw = living.getBedOrientation().toYRot() + 180.0f;

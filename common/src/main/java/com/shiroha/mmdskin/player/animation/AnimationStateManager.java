@@ -1,5 +1,8 @@
 package com.shiroha.mmdskin.player.animation;
 
+import com.shiroha.mmdskin.NativeFunc;
+import com.shiroha.mmdskin.renderer.integration.DetachedRagdollRegistry;
+import com.shiroha.mmdskin.renderer.integration.RagdollTerrainBridge;
 import com.shiroha.mmdskin.player.runtime.EntityAnimState;
 import com.shiroha.mmdskin.renderer.runtime.animation.MMDAnimManager;
 import com.shiroha.mmdskin.renderer.runtime.model.MMDModelManager.Model;
@@ -21,6 +24,34 @@ public class AnimationStateManager {
     static final String DRINK_ANIMATION = "Drink";
 
     public static void updateAnimationState(AbstractClientPlayer player, Model model) {
+        updateAnimationState(player, model, 1.0f);
+    }
+
+    public static void updateAnimationState(AbstractClientPlayer player, Model model, float tickDelta) {
+        // Player PMX models use the same one-shot native ragdoll transition
+        // as replacement mobs. Keep action/hand layers frozen after death.
+        if (player.getHealth() <= 0.0f) {
+            if (model.entityData.stateLayers[0] != EntityAnimState.State.Die) {
+                if (NativeFunc.GetInst().StartRagdoll(model.model.getModelHandle())) {
+                    model.entityData.stateLayers[0] = EntityAnimState.State.Die;
+                    model.entityData.layerAnimationKeys[0] = "die";
+                    RagdollTerrainBridge.install(player, model,
+                            net.minecraft.util.Mth.rotLerp(tickDelta, player.yBodyRotO, player.yBodyRot),
+                            tickDelta);
+                    DetachedRagdollRegistry.capture(player, model,
+                            net.minecraft.util.Mth.rotLerp(tickDelta, player.yBodyRotO, player.yBodyRot));
+                } else {
+                    changeAnimationOnce(model, EntityAnimState.State.Die, 0);
+                }
+            }
+            return;
+        }
+
+        if (model.entityData.stateLayers[0] == EntityAnimState.State.Die) {
+            model.model.resetPhysics();
+            model.entityData.invalidateStateLayers();
+        }
+
         if (model.entityData.playCustomAnim) {
             if (!model.entityData.playStageAnim) {
                 boolean local = isLocalPlayer(player);

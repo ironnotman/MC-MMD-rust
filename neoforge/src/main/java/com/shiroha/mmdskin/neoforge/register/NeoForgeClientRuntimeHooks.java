@@ -4,8 +4,12 @@ package com.shiroha.mmdskin.neoforge.register;
 import com.shiroha.mmdskin.bonesync.BoneSyncManager;
 import com.shiroha.mmdskin.config.UIConstants;
 import com.shiroha.mmdskin.debug.client.PerformanceHud;
+import com.shiroha.mmdskin.neoforge.YsmCompat;
 import com.shiroha.mmdskin.neoforge.network.MmdSkinNetworkPack;
+import com.shiroha.mmdskin.player.animation.AnimationStateManager;
+import com.shiroha.mmdskin.player.model.PlayerModelResolver;
 import com.shiroha.mmdskin.player.runtime.MmdSkinRendererPlayerHelper;
+import com.shiroha.mmdskin.renderer.integration.DetachedRagdollRegistry;
 import com.shiroha.mmdskin.renderer.runtime.model.MMDModelManager;
 import com.shiroha.mmdskin.stage.application.StageSessionService;
 import com.shiroha.mmdskin.stage.client.camera.MMDCameraController;
@@ -48,10 +52,13 @@ final class NeoForgeClientRuntimeHooks {
     public void onClientTick(ClientTickEvent.Post event) {
         Minecraft minecraft = Minecraft.getInstance();
         if (minecraft.player == null) {
+            DetachedRagdollRegistry.clear();
             return;
         }
 
         MMDModelManager.tick();
+        DetachedRagdollRegistry.tick();
+        ensureFirstPersonDeathCaptured(minecraft);
         StageAnimSyncHelper.tickPending();
         BoneSyncManager.tickLocal();
 
@@ -102,6 +109,7 @@ final class NeoForgeClientRuntimeHooks {
 
     @SubscribeEvent
     public void onPlayerLoggedOut(ClientPlayerNetworkEvent.LoggingOut event) {
+        DetachedRagdollRegistry.clear();
         MMDCameraController.getInstance().exitStageMode();
         PlayerModelSyncManager.onDisconnect();
         MmdSkinRendererPlayerHelper.onDisconnect();
@@ -122,6 +130,20 @@ final class NeoForgeClientRuntimeHooks {
     @SubscribeEvent
     public void onRenderGui(RenderGuiEvent.Post event) {
         PerformanceHud.render(event.getGuiGraphics());
+    }
+
+    /** The local player may die in first person without ever rendering its model. */
+    private static void ensureFirstPersonDeathCaptured(Minecraft minecraft) {
+        if (minecraft.player.getHealth() > 0.0f
+                || DetachedRagdollRegistry.isCaptured(minecraft.player)
+                || YsmCompat.isYsmActive(minecraft.player)) {
+            return;
+        }
+        PlayerModelResolver.Result selected = PlayerModelResolver.resolve(minecraft.player);
+        if (selected == null || selected.model() == null || selected.model().model == null) return;
+
+        selected.model().loadModelProperties(false);
+        AnimationStateManager.updateAnimationState(minecraft.player, selected.model(), 1.0f);
     }
 
     private void exitStageModeIfLocalPlayer(UUID playerId) {

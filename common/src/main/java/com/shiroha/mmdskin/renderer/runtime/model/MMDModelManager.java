@@ -20,6 +20,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Properties;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.logging.log4j.LogManager;
@@ -132,6 +133,53 @@ public class MMDModelManager {
     public static void tick() {
         modelCache.tick(MMDModelManager::disposeModel);
         MMDTextureManager.tick();
+    }
+
+    /**
+     * Give the deceased entity's current, already simulated PMX model its own
+     * cache identity. A respawned player must receive a fresh live model rather
+     * than resetting the Bullet skeleton still used by the old corpse.
+     */
+    public static boolean detachForRagdoll(Model model) {
+        if (modelCache == null || model == null || model.model == null || model.entityName == null) {
+            return false;
+        }
+        String previousKey = model.entityName;
+        ModelCache.CacheEntry<Model> removed = modelCache.remove(previousKey);
+        if (removed == null) {
+            return false;
+        }
+        if (removed.value != model) {
+            modelCache.put(previousKey, removed.value);
+            return false;
+        }
+
+        String corpseKey = previousKey + "_detached_corpse_" + UUID.randomUUID();
+        model.entityName = corpseKey;
+        modelCache.put(corpseKey, model);
+        return true;
+    }
+
+    /** Refresh the cache TTL; return false if a reload already disposed it. */
+    public static boolean touchDetachedRagdoll(Model model) {
+        if (modelCache == null || model == null || model.model == null || model.entityName == null) {
+            return false;
+        }
+        ModelCache.CacheEntry<Model> entry = modelCache.get(model.entityName);
+        return entry != null && entry.value == model && model.model.getModelHandle() != 0L;
+    }
+
+    /** Release corpse-only native and GL resources as soon as its timer ends. */
+    public static void releaseDetachedRagdoll(Model model) {
+        if (modelCache == null || model == null || model.entityName == null) {
+            return;
+        }
+        ModelCache.CacheEntry<Model> entry = modelCache.remove(model.entityName);
+        if (entry != null && entry.value == model) {
+            disposeModel(model);
+        } else if (entry != null) {
+            modelCache.put(model.entityName, entry.value);
+        }
     }
 
     private static Model createModelWrapper(String name, IMMDModel model, String modelName) {
