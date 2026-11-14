@@ -1,6 +1,9 @@
 name: MMD Ragdoll - Windows NeoForge preview
 
 on:
+  push:
+    branches:
+      - ragdoll-preview
   workflow_dispatch:
 
 permissions:
