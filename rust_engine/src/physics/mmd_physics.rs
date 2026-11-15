@@ -24,6 +24,15 @@ const RAGDOLL_ACTOR_COLLISION_GROUP: i32 = 0x4000;
 const RAGDOLL_CORE_TAG: i32 = 1;
 const RAGDOLL_ACTOR_TAG: i32 = 2;
 
+/// The skinning update order matters after death: synthetic rig roots move
+/// first, articulated bodies second, and PMX rotation-only accessories last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhysicsBoneUpdate {
+    RagdollRoot,
+    Dynamic,
+    RotationOnly,
+}
+
 /// The body must be dropped before its collision shape. Neither is owned by
 /// BulletWorld; we detach the body before Rust drops either one.
 struct TerrainCollider {
@@ -67,8 +76,14 @@ pub struct MMDPhysics {
     // --- 预分配缓冲区（避免每帧堆分配） ---
     /// 动态刚体关联的骨骼索引集合（构建时计算一次）
     dynamic_bone_indices: HashSet<usize>,
+    /// Bones whose world positions (not only rotation) come from Bullet.
+    position_driven_bone_indices: HashSet<usize>,
+    /// Virtual control bone(s) that move with a dynamic body but have no PMX collider.
+    ragdoll_root_bone_indices: HashSet<usize>,
+    /// (control bone, anatomical rigid body, death-pose control-to-body offset)
+    ragdoll_root_anchor: Option<(usize, usize, Mat4)>,
     /// 动态骨骼变换结果缓冲区（复用内存）
-    dynamic_bone_buf: Vec<(usize, Mat4)>,
+    dynamic_bone_buf: Vec<(usize, Mat4, PhysicsBoneUpdate)>,
 
     /// 上一帧模型世界位置（用于计算移动速度实现惯性）
     prev_model_position: Option<Vec3>,
@@ -99,6 +114,9 @@ impl MMDPhysics {
             fps: config.physics_fps,
             max_substep_count: config.max_substep_count,
             dynamic_bone_indices: HashSet::new(),
+            position_driven_bone_indices: HashSet::new(),
+            ragdoll_root_bone_indices: HashSet::new(),
+            ragdoll_root_anchor: None,
             dynamic_bone_buf: Vec::new(),
             prev_model_position: None,
         })
@@ -200,6 +218,12 @@ impl MMDPhysics {
             .rigid_bodies
             .iter()
             .filter(|rb| rb.physics_mode != PhysicsMode::FollowBone && rb.bone_index >= 0)
+            .map(|rb| rb.bone_index as usize)
+            .collect();
+        self.position_driven_bone_indices = self
+            .rigid_bodies
+            .iter()
+            .filter(|rb| rb.physics_mode == PhysicsMode::Physics && rb.bone_index >= 0)
             .map(|rb| rb.bone_index as usize)
             .collect();
 
@@ -476,6 +500,8 @@ impl MMDPhysics {
                 body.set_ragdoll_tag(RAGDOLL_CORE_TAG);
                 rb.physics_mode = PhysicsMode::Physics;
                 self.dynamic_bone_indices.insert(rb.bone_index as usize);
+                self.position_driven_bone_indices
+                    .insert(rb.bone_index as usize);
             }
             let group = 1i32 << rb.group.min(15);
             self.world
@@ -498,6 +524,32 @@ impl MMDPhysics {
             .iter()
             .map(|&(rb_idx, bone_idx)| (bone_idx, rb_idx))
             .collect();
+        // PMX rigs often have unphysical control bones (all-parent, center,
+        // groove, waist) above BOTH upper-body and lower-body colliders. If
+        // those controls remain upright, meshes weighted to them form tall
+        // stretched spikes as the simulated body falls. Follow the primary
+        // anatomical root with the topmost unphysical ancestor, then let the
+        // regular skeleton hierarchy propagate through the intermediate bones.
+        let unattached_roots: Vec<(usize, usize)> = original_kinematic
+            .iter()
+            .copied()
+            .filter(|&(_, bone)| nearest_ragdoll_parent(bone, bone_parents, &by_bone).is_none())
+            .collect();
+        if let Some(&(anchor_rb, anchor_bone)) = unattached_roots.first() {
+            if let Some(root_bone) = highest_ancestor(anchor_bone, bone_parents) {
+                if root_bone != anchor_bone
+                    && root_bone < bone_transforms.len()
+                    && !self.dynamic_bone_indices.contains(&root_bone)
+                {
+                    let root_offset = bone_transforms[anchor_bone].inverse()
+                        * bone_transforms[root_bone];
+                    self.ragdoll_root_anchor = Some((root_bone, anchor_rb, root_offset));
+                    self.ragdoll_root_bone_indices.insert(root_bone);
+                    self.dynamic_bone_indices.insert(root_bone);
+                    self.position_driven_bone_indices.insert(root_bone);
+                }
+            }
+        }
         let mut added = 0usize;
         for &(child_rb_idx, child_bone_idx) in &original_kinematic {
             let Some(parent_rb_idx) =
@@ -543,6 +595,60 @@ impl MMDPhysics {
             }
         }
 
+        // Two anatomical roots can share a non-physical pelvis bone. The
+        // parent-walk above cannot connect siblings via that missing body,
+        // leaving the whole torso as a separate floating physics island.
+        // Connect near root siblings at their deepest common PMX ancestor.
+        let mut root_bridges = 0usize;
+        if let Some(&(anchor_rb, anchor_bone)) = unattached_roots.first() {
+            for &(child_rb, child_bone) in unattached_roots.iter().skip(1) {
+                let Some(pelvis_bone) = common_ancestor(anchor_bone, child_bone, bone_parents)
+                else { continue };
+                if pelvis_bone >= bone_transforms.len() { continue; }
+                // A shared world-control root alone is not an anatomical
+                // joint; do not glue unrelated accessories together.
+                if bone_parents.get(pelvis_bone).copied().unwrap_or(-1) < 0 {
+                    continue;
+                }
+                let separation = bone_transforms[anchor_bone].w_axis.truncate()
+                    .distance(bone_transforms[child_bone].w_axis.truncate());
+                if separation > 6.0 { continue; }
+                if self.joints.iter().any(|joint| {
+                    (joint.rigid_body_a_index == anchor_rb as i32
+                        && joint.rigid_body_b_index == child_rb as i32)
+                        || (joint.rigid_body_a_index == child_rb as i32
+                            && joint.rigid_body_b_index == anchor_rb as i32)
+                }) {
+                    continue;
+                }
+
+                let parent = self.rigid_bodies[anchor_rb].bullet_body.as_ref().unwrap();
+                let child = self.rigid_bodies[child_rb].bullet_body.as_ref().unwrap();
+                let pivot = super::inv_z(bone_transforms[pelvis_bone]);
+                let frame_a = parent.get_transform().inverse() * pivot;
+                let frame_b = child.get_transform().inverse() * pivot;
+                if let Some(joint) =
+                    BulletConstraint::new_6dof_spring(parent, child, frame_a, frame_b, true)
+                {
+                    joint.set_linear_lower_limit(0.0, 0.0, 0.0);
+                    joint.set_linear_upper_limit(0.0, 0.0, 0.0);
+                    joint.set_angular_lower_limit(-0.65, -0.65, -0.65);
+                    joint.set_angular_upper_limit(0.65, 0.65, 0.65);
+                    for axis in 0..6 {
+                        joint.set_param(BT_CONSTRAINT_STOP_ERP, 0.475, axis);
+                    }
+                    self.world.add_constraint(&joint, true);
+                    self.joints.push(MmdJointData {
+                        name: format!("ragdoll_pelvis_bridge_{}", pelvis_bone),
+                        rigid_body_a_index: anchor_rb as i32,
+                        rigid_body_b_index: child_rb as i32,
+                        constraint: Some(joint),
+                    });
+                    root_bridges += 1;
+                }
+            }
+        }
+
         if let Some(shape) = BulletShape::r#box(32.0, 0.5, 32.0) {
             let info = RigidBodyInfo {
                 mass: 0.0,
@@ -565,8 +671,10 @@ impl MMDPhysics {
 
         self.prev_model_position = None;
         log::info!(
-            "[MMD ragdoll] {} core bodies dynamic, {} anatomical constraints, floor={}",
-            original_kinematic.len(), added, self.ragdoll_floor_body.is_some()
+            "[MMD ragdoll] {} core bodies dynamic, {} anatomical constraints, {} root bridges, control root={:?}, floor={}",
+            original_kinematic.len(), added, root_bridges,
+            self.ragdoll_root_anchor.as_ref().map(|&(bone, _, _)| bone),
+            self.ragdoll_floor_body.is_some()
         );
         true
     }
@@ -774,8 +882,31 @@ impl MMDPhysics {
     pub fn get_dynamic_bone_transforms(
         &mut self,
         current_bone_transforms: &[Mat4],
-    ) -> &[(usize, Mat4)] {
+    ) -> (
+        &[(usize, Mat4, PhysicsBoneUpdate)],
+        &HashSet<usize>,
+        &HashSet<usize>,
+        &HashSet<usize>,
+    ) {
         self.dynamic_bone_buf.clear();
+
+        // Synthetic root must be applied before the original rigid-body
+        // transforms. The model's control chain has no Bullet collider, but
+        // may still carry skin weights ("all parent" is not necessarily empty).
+        if let Some((root_bone, anchor_rb, root_offset)) = self.ragdoll_root_anchor {
+            if let Some(rb_data) = self.rigid_bodies.get(anchor_rb) {
+                if let Some(ref body) = rb_data.bullet_body {
+                    let anchor_right = super::inv_z(
+                        rb_data.compute_bone_matrix(body.get_transform())
+                    );
+                    self.dynamic_bone_buf.push((
+                        root_bone,
+                        anchor_right * root_offset,
+                        PhysicsBoneUpdate::RagdollRoot,
+                    ));
+                }
+            }
+        }
         for rb_data in &self.rigid_bodies {
             if rb_data.physics_mode == PhysicsMode::FollowBone {
                 continue;
@@ -799,11 +930,24 @@ impl MMDPhysics {
                     }
                     PhysicsMode::FollowBone => unreachable!(),
                 };
-                self.dynamic_bone_buf
-                    .push((bone_idx as usize, super::inv_z(new_bone_left)));
+                let update_kind = match rb_data.physics_mode {
+                    PhysicsMode::Physics => PhysicsBoneUpdate::Dynamic,
+                    PhysicsMode::PhysicsWithBone => PhysicsBoneUpdate::RotationOnly,
+                    PhysicsMode::FollowBone => unreachable!(),
+                };
+                self.dynamic_bone_buf.push((
+                    bone_idx as usize,
+                    super::inv_z(new_bone_left),
+                    update_kind,
+                ));
             }
         }
-        &self.dynamic_bone_buf
+        (
+            &self.dynamic_bone_buf,
+            &self.ragdoll_root_bone_indices,
+            &self.position_driven_bone_indices,
+            &self.dynamic_bone_indices,
+        )
     }
 
     /// 获取动态骨骼索引集合的引用（构建时已预计算，零分配）
@@ -901,9 +1045,66 @@ fn nearest_ragdoll_parent(
     None
 }
 
+/// Topmost ancestor of a PMX control chain, including the starting bone.
+/// A cycle/invalid parent is treated as bad model data rather than looping.
+fn highest_ancestor(start: usize, parents: &[i32]) -> Option<usize> {
+    let mut current = start;
+    for _ in 0..parents.len() {
+        let parent = *parents.get(current)?;
+        if parent == -1 {
+            return Some(current);
+        }
+        let next = usize::try_from(parent).ok()?;
+        if next == current || next >= parents.len() {
+            return None;
+        }
+        current = next;
+    }
+    None
+}
+
+/// Deepest common control bone used as the missing articulation pivot. A PMX
+/// upper-body and lower-body pair can both descend from a collider-free waist.
+fn common_ancestor(a: usize, b: usize, parents: &[i32]) -> Option<usize> {
+    let mut a_ancestors = HashSet::new();
+    let mut current = a;
+    for _ in 0..parents.len() {
+        a_ancestors.insert(current);
+        let next = usize::try_from(*parents.get(current)?).ok();
+        match next {
+            Some(n) if n < parents.len() && n != current => current = n,
+            _ => break,
+        }
+    }
+    let mut current = b;
+    for _ in 0..parents.len() {
+        if a_ancestors.contains(&current) {
+            return Some(current);
+        }
+        let next = usize::try_from(*parents.get(current)?).ok()?;
+        if next >= parents.len() || next == current {
+            return None;
+        }
+        current = next;
+    }
+    None
+}
+
 #[cfg(test)]
 mod ragdoll_tests {
     use super::*;
+
+    #[test]
+    fn pelvis_without_rigid_body_still_connects_two_anatomical_roots() {
+        // 0 all-parent -> 1 center -> 2 waist -> {3 lower, 4 upper}.
+        let parents = [-1, 0, 1, 2, 2, 4];
+        let by_bone = HashMap::from([(3, 0usize), (4, 1usize), (5, 2usize)]);
+        assert_eq!(highest_ancestor(3, &parents), Some(0));
+        assert_eq!(common_ancestor(3, 4, &parents), Some(2));
+        assert_eq!(nearest_ragdoll_parent(3, &parents, &by_bone), None);
+        assert_eq!(nearest_ragdoll_parent(4, &parents, &by_bone), None);
+        assert_eq!(nearest_ragdoll_parent(5, &parents, &by_bone), Some(1));
+    }
 
     #[test]
     fn moving_minecraft_actors_keep_a_stable_collision_proxy() {

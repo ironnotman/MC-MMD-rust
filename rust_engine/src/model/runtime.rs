@@ -2550,19 +2550,51 @@ impl MmdModel {
         physics.step_simulation(delta_time, &config);
 
         // 3. 同步物理结果回骨骼（复用内部缓冲区）
-        let dynamic_bone_transforms =
+        let (dynamic_bone_transforms, control_roots, position_driven_bones, all_dynamic_bones) =
             physics.get_dynamic_bone_transforms(&self.physics_bone_transforms_buf);
 
-        for &(bone_idx, transform) in dynamic_bone_transforms {
+        if self.ragdoll_active {
+            // A PMX control root ("all parent" -> center -> groove -> waist)
+            // can own skinned vertices without having a collider. Move it with
+            // the pelvis before applying independent limb/head body poses.
+            for &(bone_idx, transform, kind) in dynamic_bone_transforms {
+                if kind == crate::physics::PhysicsBoneUpdate::RagdollRoot {
+                    self.bone_manager.set_global_transform_physics(bone_idx, transform);
+                }
+            }
+            if !control_roots.is_empty() {
+                self.bone_manager.update_non_physics_children(control_roots);
+            }
+
+            // Complete bone positions come from the articulated Bullet bodies.
+            for &(bone_idx, transform, kind) in dynamic_bone_transforms {
+                if kind == crate::physics::PhysicsBoneUpdate::Dynamic {
+                    self.bone_manager.set_global_transform_physics(bone_idx, transform);
+                }
+            }
+
+            // PMX mode 2 (hair/ribbons) takes only rotation from Bullet.
+            // Their positions must first inherit the fallen head/torso pose.
             self.bone_manager
-                .set_global_transform_physics(bone_idx, transform);
+                .update_non_physics_children(position_driven_bones);
+            for &(bone_idx, mut transform, kind) in dynamic_bone_transforms {
+                if kind != crate::physics::PhysicsBoneUpdate::RotationOnly {
+                    continue;
+                }
+                transform.w_axis = self.bone_manager.get_global_transform(bone_idx).w_axis;
+                self.bone_manager.set_global_transform_physics(bone_idx, transform);
+            }
+        } else {
+            // Keep live-model physics unchanged in this ragdoll-only patch.
+            for &(bone_idx, transform, _) in dynamic_bone_transforms {
+                self.bone_manager.set_global_transform_physics(bone_idx, transform);
+            }
         }
 
-        let physics_bone_indices = physics.get_dynamic_bone_indices();
         self.bone_manager
-            .set_physics_bone_indices(physics_bone_indices);
+            .set_physics_bone_indices(all_dynamic_bones);
         self.bone_manager
-            .update_non_physics_children(physics_bone_indices);
+            .update_non_physics_children(all_dynamic_bones);
 
         // 归还所有权
         self.physics = Some(physics);

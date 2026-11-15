@@ -21,5 +21,5 @@ pub(crate) fn inv_z(m: Mat4) -> Mat4 {
 pub use bullet_ffi::{get_alloc_stats, BulletAllocStats};
 pub use config::{get_config, reset_config, set_config, PhysicsConfig};
 pub use mmd_joint::MmdJointData;
-pub use mmd_physics::MMDPhysics;
+pub use mmd_physics::{MMDPhysics, PhysicsBoneUpdate};
 pub use mmd_rigid_body::{MmdRigidBodyData, PhysicsMode};
