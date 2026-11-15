@@ -99,6 +99,15 @@ struct KinematicDynamicFilter : public btOverlapFilterCallback {
         auto* obj1 = static_cast<btCollisionObject*>(proxy1->m_clientObject);
         if (!obj0 || !obj1) return true;
 
+        // PMX anatomical colliders overlap at rest. Once they become dynamic,
+        // resolving their self-overlaps would instantly explode the skeleton.
+        // The actual bone-to-bone linkage is enforced by Bullet constraints.
+        if (obj0->getUserIndex2() == 1 && obj1->getUserIndex2() == 1) return false;
+
+        // External living entities use a special kinematic body. Unlike PMX
+        // kinematic accessory markers, they must be allowed to push ragdolls.
+        if (obj0->getUserIndex2() == 2 || obj1->getUserIndex2() == 2) return true;
+
         bool k0 = obj0->isKinematicObject();
         bool k1 = obj1->isKinematicObject();
         if (k0 != k1) return false;
@@ -190,6 +199,13 @@ void bw_world_set_kinematic_filter(BW_World* w, bool enabled) {
         delete w->kinematicFilter;
         w->kinematicFilter = nullptr;
     }
+}
+
+void bw_world_set_solver_iterations(BW_World* w, int iterations) {
+    if (!w) return;
+    if (iterations < 1) iterations = 1;
+    if (iterations > 64) iterations = 64;
+    w->world->getSolverInfo().m_numIterations = iterations;
 }
 
 /* ===== 碰撞形状 ===== */
@@ -423,6 +439,11 @@ void bw_rigid_body_apply_central_force(BW_RigidBody* rb, float x, float y, float
     if (!rb) return;
     btRigidBody* body = (btRigidBody*)rb;
     body->applyCentralForce(btVector3(x, y, z));
+}
+
+void bw_rigid_body_set_ragdoll_tag(BW_RigidBody* rb, int tag) {
+    if (!rb) return;
+    ((btRigidBody*)rb)->setUserIndex2(tag);
 }
 
 /* ===== 6DOF 弹簧约束 ===== */

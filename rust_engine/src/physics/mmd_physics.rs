@@ -19,10 +19,23 @@ use super::mmd_joint::MmdJointData;
 use super::mmd_rigid_body::{MmdRigidBodyData, PhysicsMode};
 
 const MAX_RAGDOLL_TERRAIN_BOXES: usize = 256;
+const MAX_RAGDOLL_ACTORS: usize = 16;
+const RAGDOLL_ACTOR_COLLISION_GROUP: i32 = 0x4000;
+const RAGDOLL_CORE_TAG: i32 = 1;
+const RAGDOLL_ACTOR_TAG: i32 = 2;
 
 /// The body must be dropped before its collision shape. Neither is owned by
 /// BulletWorld; we detach the body before Rust drops either one.
 struct TerrainCollider {
+    body: BulletRigidBody,
+    _shape: BulletShape,
+}
+
+/// Kinematic collision proxy for a nearby Minecraft player or mob. Retaining
+/// it across ticks lets Bullet derive motion and push the dynamic ragdoll.
+struct ActorCollider {
+    entity_id: i32,
+    half_extents: Vec3,
     body: BulletRigidBody,
     _shape: BulletShape,
 }
@@ -42,6 +55,8 @@ pub struct MMDPhysics {
     ragdoll_floor_shape: Option<BulletShape>,
     /// Snapshot of nearby Minecraft block collision boxes in PMX model space.
     ragdoll_terrain: Vec<TerrainCollider>,
+    /// Moving Minecraft entities, driven by 20 Hz client AABB snapshots.
+    ragdoll_actors: Vec<ActorCollider>,
     /// Bullet3 物理世界
     world: BulletWorld,
     /// 物理 FPS
@@ -79,6 +94,7 @@ impl MMDPhysics {
             ragdoll_floor_body: None,
             ragdoll_floor_shape: None,
             ragdoll_terrain: Vec::new(),
+            ragdoll_actors: Vec::new(),
             world,
             fps: config.physics_fps,
             max_substep_count: config.max_substep_count,
@@ -439,6 +455,8 @@ impl MMDPhysics {
             if let Some(ref body) = rb.bullet_body {
                 let bone_left = super::inv_z(bone_transforms[bone_idx]);
                 body.set_transform(rb.compute_body_matrix(bone_left));
+                body.set_linear_velocity(0.0, 0.0, 0.0);
+                body.set_angular_velocity(0.0, 0.0, 0.0);
             }
         }
 
@@ -455,13 +473,23 @@ impl MMDPhysics {
                 body.set_mass(rb.mass.max(0.75));
                 body.set_damping(0.12, 0.35);
                 body.clear_forces();
+                body.set_ragdoll_tag(RAGDOLL_CORE_TAG);
                 rb.physics_mode = PhysicsMode::Physics;
                 self.dynamic_bone_indices.insert(rb.bone_index as usize);
             }
             let group = 1i32 << rb.group.min(15);
             self.world
-                .add_rigid_body(body, group, (rb.group_mask | 0x8000) as i32);
+                .add_rigid_body(body, group, (rb.group_mask | 0xC000) as i32);
         }
+
+        // A few dozen bone constraints benefit from extra solver iterations.
+        // Core-body self-collisions are also suppressed by the existing PMX
+        // broadphase filter, preventing the immediate overlap explosion.
+        self.world.set_solver_iterations(24);
+        // The ragdoll-specific broadphase exclusions are implemented in this
+        // filter, so they must remain active even if an earlier config disabled
+        // the regular MMD kinematic/dynamic filter.
+        self.world.set_kinematic_filter(true);
 
         // Build anatomical joints from the PMX bone hierarchy. Standard PMX
         // models typically have spring constraints for clothing, but none for
@@ -612,9 +640,98 @@ impl MMDPhysics {
         true
     }
 
+    /// Update kinematic collision proxies for nearby live Minecraft actors.
+    /// IDs are stable within a client world; all boxes are relative to the
+    /// dead entity's original feet, as with the terrain snapshots.
+    pub fn set_ragdoll_actors(
+        &mut self,
+        entity_ids: &[i32],
+        relative_boxes: &[f32],
+        body_yaw_radians: f32,
+        model_scale: f32,
+    ) -> bool {
+        if entity_ids.len() > MAX_RAGDOLL_ACTORS
+            || relative_boxes.len() != entity_ids.len() * 6
+            || !body_yaw_radians.is_finite()
+            || !model_scale.is_finite()
+            || model_scale <= 0.0001
+        {
+            return false;
+        }
+
+        let mut updates = Vec::with_capacity(entity_ids.len());
+        let mut unique = HashSet::with_capacity(entity_ids.len());
+        for (&id, bounds) in entity_ids.iter().zip(relative_boxes.chunks_exact(6)) {
+            if !unique.insert(id) {
+                return false;
+            }
+            let Some((half, pose)) = terrain_box_pose(bounds, body_yaw_radians, model_scale)
+            else {
+                return false;
+            };
+            updates.push((id, half, pose));
+        }
+
+        let mut index = 0;
+        while index < self.ragdoll_actors.len() {
+            if unique.contains(&self.ragdoll_actors[index].entity_id) {
+                index += 1;
+            } else {
+                let actor = self.ragdoll_actors.remove(index);
+                self.world.remove_rigid_body(&actor.body);
+            }
+        }
+
+        for (id, half, pose) in updates {
+            if let Some(index) = self.ragdoll_actors.iter().position(|actor| actor.entity_id == id) {
+                let actor = &self.ragdoll_actors[index];
+                if (actor.half_extents - half).abs().max_element() < 0.005 {
+                    actor.body.set_transform(pose);
+                    continue;
+                }
+                let old = self.ragdoll_actors.remove(index);
+                self.world.remove_rigid_body(&old.body);
+            }
+
+            let Some(shape) = BulletShape::r#box(half.x, half.y, half.z) else {
+                return false;
+            };
+            let info = RigidBodyInfo {
+                mass: 0.0,
+                linear_damping: 0.0,
+                angular_damping: 0.0,
+                friction: 0.8,
+                restitution: 0.0,
+                additional_damping: false,
+                is_kinematic: true,
+                disable_deactivation: true,
+                no_contact_response: false,
+                initial_transform: pose,
+            };
+            let Some(body) = BulletRigidBody::new(&info, &shape) else {
+                return false;
+            };
+            body.set_ragdoll_tag(RAGDOLL_ACTOR_TAG);
+            self.world.add_rigid_body(&body, RAGDOLL_ACTOR_COLLISION_GROUP, -1);
+            self.ragdoll_actors.push(ActorCollider {
+                entity_id: id,
+                half_extents: half,
+                body,
+                _shape: shape,
+            });
+        }
+        true
+    }
+
     fn clear_terrain(&mut self) {
         for collider in self.ragdoll_terrain.drain(..) {
             self.world.remove_rigid_body(&collider.body);
+        }
+    }
+
+    fn clear_actors(&mut self) {
+        for actor in self.ragdoll_actors.drain(..) {
+            self.world.remove_rigid_body(&actor.body);
         }
     }
 
@@ -642,6 +759,10 @@ impl MMDPhysics {
     #[cfg(test)]
     pub fn ragdoll_terrain_count(&self) -> usize {
         self.ragdoll_terrain.len()
+    }
+    #[cfg(test)]
+    pub fn ragdoll_actor_count(&self) -> usize {
+        self.ragdoll_actors.len()
     }
     pub fn joint_count(&self) -> usize {
         self.joints.len()
@@ -715,6 +836,7 @@ impl Drop for MMDPhysics {
             self.world.remove_rigid_body(floor);
         }
         self.clear_terrain();
+        self.clear_actors();
         // 之后 Rust 自动 drop 各字段（约束/刚体/世界），此时世界已为空，安全释放
 
         // 泄漏检测日志（仅在当前实例释放后检查全局计数）
@@ -782,6 +904,59 @@ fn nearest_ragdoll_parent(
 #[cfg(test)]
 mod ragdoll_tests {
     use super::*;
+
+    #[test]
+    fn moving_minecraft_actors_keep_a_stable_collision_proxy() {
+        let mut physics = MMDPhysics::new().expect("Bullet world");
+        let first = [-1.0, 0.0, -0.5, -0.4, 1.8, 0.5];
+        assert!(physics.set_ragdoll_actors(&[11], &first, 0.0, 1.0));
+        assert_eq!(physics.ragdoll_actor_count(), 1);
+        let first_position = physics.ragdoll_actors[0].body.get_position();
+
+        let second = [-0.5, 0.0, -0.5, 0.1, 1.8, 0.5];
+        assert!(physics.set_ragdoll_actors(&[11], &second, 0.0, 1.0));
+        assert_eq!(physics.ragdoll_actor_count(), 1);
+        assert!((physics.ragdoll_actors[0].body.get_position().x - first_position.x - 0.5).abs() < 0.001);
+
+        // Invalid input must preserve the previous collider state.
+        assert!(!physics.set_ragdoll_actors(&[11, 11], &[0.0; 12], 0.0, 1.0));
+        assert_eq!(physics.ragdoll_actor_count(), 1);
+        assert!(physics.set_ragdoll_actors(&[], &[], 0.0, 1.0));
+        assert_eq!(physics.ragdoll_actor_count(), 0);
+    }
+
+    #[test]
+    fn anatomical_bodies_do_not_explode_from_self_collision() {
+        let physics = MMDPhysics::new().expect("Bullet world");
+        physics.world.set_gravity(0.0, 0.0, 0.0);
+        physics.world.set_kinematic_filter(true);
+        let shape = BulletShape::sphere(0.5).expect("shape");
+        let info = RigidBodyInfo {
+            mass: 1.0,
+            linear_damping: 0.0,
+            angular_damping: 0.0,
+            friction: 0.5,
+            restitution: 0.0,
+            additional_damping: false,
+            is_kinematic: false,
+            disable_deactivation: true,
+            no_contact_response: false,
+            initial_transform: Mat4::from_translation(Vec3::new(0.0, 1.0, 0.0)),
+        };
+        let a = BulletRigidBody::new(&info, &shape).expect("first body");
+        let b = BulletRigidBody::new(&info, &shape).expect("second body");
+        a.set_ragdoll_tag(RAGDOLL_CORE_TAG);
+        b.set_ragdoll_tag(RAGDOLL_CORE_TAG);
+        physics.world.add_rigid_body(&a, 1, -1);
+        physics.world.add_rigid_body(&b, 1, -1);
+        for _ in 0..15 {
+            physics.world.step(1.0 / 60.0, 4, 1.0 / 60.0);
+        }
+        assert!((a.get_position() - b.get_position()).length() < 0.001,
+            "self-overlap should not push apart anatomical bodies");
+        physics.world.remove_rigid_body(&a);
+        physics.world.remove_rigid_body(&b);
+    }
 
     #[test]
     fn minecraft_boxes_mirror_z_and_rotate_with_entity_yaw() {

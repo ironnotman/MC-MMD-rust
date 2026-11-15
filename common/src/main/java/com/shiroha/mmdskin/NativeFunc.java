@@ -188,6 +188,10 @@ public class NativeFunc {
     public native boolean SetRagdollTerrain(long model, float[] relativeBoxes,
                                             float yawRadians, float blockScale);
 
+    /** Moving player/mob AABBs, updated every client tick (up to 16 actors). */
+    public native boolean SetRagdollActors(long model, int[] entityIds, float[] relativeBoxes,
+                                           float yawRadians, float blockScale);
+
     public native void ResetPhysics(long model);
 
     public native void SetPhysicsEnabled(long model, boolean enabled);

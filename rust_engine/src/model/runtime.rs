@@ -2462,6 +2462,21 @@ impl MmdModel {
             })
     }
 
+    /// Update the moving player/mob proxies in this corpse's Bullet world.
+    pub fn set_ragdoll_actors(
+        &mut self,
+        entity_ids: &[i32],
+        relative_boxes: &[f32],
+        body_yaw_radians: f32,
+        model_scale: f32,
+    ) -> bool {
+        self.ragdoll_active
+            && self.physics.as_mut().is_some_and(|physics| {
+                physics.set_ragdoll_actors(
+                    entity_ids, relative_boxes, body_yaw_radians, model_scale)
+            })
+    }
+
     /// 重置物理系统
     pub fn reset_physics(&mut self) {
         if self.ragdoll_active {
@@ -3025,6 +3040,18 @@ mod tests {
             .count();
         assert!(kinetic_after < kinetic_before);
         assert!(physics.joint_count() > before);
+        // The zero-frame pose must survive kinematic -> dynamic conversion.
+        // A mismatch here presents as immediate whole-body stretching.
+        for (rb_idx, _) in &initial_positions {
+            let rb = &physics.rigid_bodies[*rb_idx];
+            let bone_idx = rb.bone_index as usize;
+            let actual = crate::physics::inv_z(rb.compute_bone_matrix(
+                rb.bullet_body.as_ref().unwrap().get_transform(),
+            ));
+            let expected = model.bone_manager.get_global_transform(bone_idx);
+            assert!((actual.w_axis.truncate() - expected.w_axis.truncate()).length() < 0.005,
+                "bone {} jumped when ragdoll started", bone_idx);
+        }
         println!("PMX ragdoll: {} anatomical bodies, {} new joints", kinetic_before,
             physics.joint_count() - before);
         for _ in 0..40 {

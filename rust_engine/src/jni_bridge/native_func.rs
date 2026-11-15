@@ -1847,6 +1847,45 @@ pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_SetRagdollTerrain(
     0
 }
 
+/// Up to 16 nearby moving player/mob hitboxes. These are kinematic proxies,
+/// not Physics Mod/PhysX actors; only the local Bullet corpse is affected.
+#[no_mangle]
+pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_SetRagdollActors(
+    env: JNIEnv,
+    _class: JClass,
+    model: jlong,
+    entity_ids: jni::objects::JIntArray,
+    relative_boxes: jni::objects::JFloatArray,
+    body_yaw_radians: jfloat,
+    model_scale: jfloat,
+) -> jboolean {
+    let (Ok(count), Ok(box_len)) = (
+        env.get_array_length(&entity_ids),
+        env.get_array_length(&relative_boxes),
+    ) else {
+        return 0;
+    };
+    if count < 0 || count > 16 || box_len != count * 6 {
+        return 0;
+    }
+    let mut ids = vec![0i32; count as usize];
+    let mut boxes = vec![0.0f32; box_len as usize];
+    if env.get_int_array_region(&entity_ids, 0, &mut ids).is_err()
+        || env.get_float_array_region(&relative_boxes, 0, &mut boxes).is_err()
+    {
+        return 0;
+    }
+
+    let models = MODELS.read().unwrap();
+    if let Some(model_arc) = models.get(&model) {
+        let mut model = model_arc.lock().unwrap();
+        if model.set_ragdoll_actors(&ids, &boxes, body_yaw_radians, model_scale) {
+            return 1;
+        }
+    }
+    0
+}
+
 /// 重置物理系统
 #[no_mangle]
 pub extern "system" fn Java_com_shiroha_mmdskin_NativeFunc_ResetPhysics(

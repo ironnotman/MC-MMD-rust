@@ -68,6 +68,7 @@ void bw_world_remove_rigid_body(BW_World* world, BW_RigidBody* rb);
 void bw_world_add_constraint(BW_World* world, BW_Constraint* c, bool disable_collision);
 void bw_world_remove_constraint(BW_World* world, BW_Constraint* c);
 void bw_world_set_kinematic_filter(BW_World* world, bool enabled);
+void bw_world_set_solver_iterations(BW_World* world, int iterations);
 
 /* ===== 碰撞形状 ===== */
 BW_Shape* bw_shape_sphere(float radius);
@@ -96,6 +97,8 @@ void bw_rigid_body_set_mass(BW_RigidBody* rb, float mass);
 float bw_rigid_body_get_mass(BW_RigidBody* rb);
 void bw_rigid_body_clear_forces(BW_RigidBody* rb);
 void bw_rigid_body_apply_central_force(BW_RigidBody* rb, float x, float y, float z);
+/** 1 = ragdoll anatomical body, 2 = external Minecraft actor collider. */
+void bw_rigid_body_set_ragdoll_tag(BW_RigidBody* rb, int tag);
 
 /* ===== 6DOF 弹簧约束 ===== */
 BW_Constraint* bw_6dof_spring_create(

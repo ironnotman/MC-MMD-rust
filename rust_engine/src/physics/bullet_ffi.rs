@@ -81,6 +81,7 @@ mod ffi {
         );
         pub fn bw_world_remove_constraint(world: *mut BW_World, c: *mut BW_Constraint);
         pub fn bw_world_set_kinematic_filter(world: *mut BW_World, enabled: bool);
+        pub fn bw_world_set_solver_iterations(world: *mut BW_World, iterations: c_int);
 
         // 碰撞形状
         pub fn bw_shape_sphere(radius: c_float) -> *mut BW_Shape;
@@ -145,6 +146,7 @@ mod ffi {
             y: c_float,
             z: c_float,
         );
+        pub fn bw_rigid_body_set_ragdoll_tag(rb: *mut BW_RigidBody, tag: c_int);
 
         // 6DOF 弹簧约束
         pub fn bw_6dof_spring_create(
@@ -254,6 +256,10 @@ impl BulletWorld {
 
     pub fn set_kinematic_filter(&self, enabled: bool) {
         unsafe { ffi::bw_world_set_kinematic_filter(self.ptr, enabled) }
+    }
+
+    pub fn set_solver_iterations(&self, iterations: i32) {
+        unsafe { ffi::bw_world_set_solver_iterations(self.ptr, iterations) }
     }
 }
 
@@ -422,6 +428,10 @@ impl BulletRigidBody {
 
     pub fn apply_central_force(&self, x: f32, y: f32, z: f32) {
         unsafe { ffi::bw_rigid_body_apply_central_force(self.ptr, x, y, z) }
+    }
+
+    pub fn set_ragdoll_tag(&self, tag: i32) {
+        unsafe { ffi::bw_rigid_body_set_ragdoll_tag(self.ptr, tag) }
     }
 
     pub fn force_activation_state(&self, state: i32) {

@@ -41,13 +41,7 @@ public final class RagdollTerrainBridge {
             return;
         }
 
-        float size = ModelPropertyHelper.getFloat(model.properties, "size", 1.0f);
-        float scale = BASE_MODEL_SCALE
-                * ModelConfigManager.getLiveConfig(model.model.getModelName()).modelScale
-                * size;
-        if (entity.isBaby() && !(entity instanceof Player)) {
-            scale *= 0.5f;
-        }
+        float scale = effectiveModelScale(entity, model);
         if (!Float.isFinite(scale) || scale <= 0.0001f || !Float.isFinite(bodyYawDegrees)) {
             return; // Leave the native emergency floor in place.
         }
@@ -124,5 +118,17 @@ public final class RagdollTerrainBridge {
         } catch (RuntimeException | LinkageError ex) {
             LOGGER.warn("[MMD ragdoll] terrain collision sampling failed; using fallback floor", ex);
         }
+    }
+
+    /** Shared conversion for Minecraft collision shapes -> PMX local units. */
+    static float effectiveModelScale(LivingEntity entity, MMDModelManager.Model model) {
+        float size = ModelPropertyHelper.getFloat(model.properties, "size", 1.0f);
+        float scale = BASE_MODEL_SCALE
+                * ModelConfigManager.getLiveConfig(model.model.getModelName()).modelScale
+                * size;
+        if (entity.isBaby() && !(entity instanceof Player)) {
+            scale *= 0.5f;
+        }
+        return scale;
     }
 }

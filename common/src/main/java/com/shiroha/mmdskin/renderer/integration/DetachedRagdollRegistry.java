@@ -69,11 +69,12 @@ public final class DetachedRagdollRegistry {
 
         model.loadModelProperties(false);
         float size = ModelPropertyHelper.getFloat(model.properties, "size", 1.0f);
+        float modelScale = RagdollTerrainBridge.effectiveModelScale(entity, model);
         long born = level.getGameTime();
         long durationTicks = Math.max(1L, (long) Math.ceil(settings.seconds() * 20.0));
         Corpse corpse = new Corpse(entity, model, level, born + durationTicks,
                 entity.getX(), entity.getY(), entity.getZ(),
-                yawDegrees, size, entity.isBaby() && !(entity instanceof Player));
+                yawDegrees, size, modelScale, entity.isBaby() && !(entity instanceof Player));
         world = level;
         CORPSES.add(corpse);
         while (CORPSES.size() > settings.maxCorpses()) {
@@ -104,6 +105,8 @@ public final class DetachedRagdollRegistry {
                 CORPSES.remove(i); // a model reload already disposed this model
                 continue;
             }
+            RagdollActorBridge.refresh(corpse.world, corpse.original, corpse.model,
+                    corpse.x, corpse.y, corpse.z, corpse.yaw, corpse.modelScale);
             ((AbstractMMDModel) corpse.model.model).tickDetachedRagdoll();
         }
     }
@@ -169,13 +172,13 @@ public final class DetachedRagdollRegistry {
         final ClientLevel world;
         final long expiresAt;
         final double x, y, z;
-        final float yaw, scale;
+        final float yaw, scale, modelScale;
         final boolean baby;
         boolean firstRender = true;
 
         Corpse(LivingEntity original, MMDModelManager.Model model, ClientLevel world,
                long expiresAt, double x, double y, double z,
-               float yaw, float scale, boolean baby) {
+               float yaw, float scale, float modelScale, boolean baby) {
             this.original = original;
             this.model = model;
             this.world = world;
@@ -185,6 +188,7 @@ public final class DetachedRagdollRegistry {
             this.z = z;
             this.yaw = yaw;
             this.scale = scale;
+            this.modelScale = modelScale;
             this.baby = baby;
         }
     }
