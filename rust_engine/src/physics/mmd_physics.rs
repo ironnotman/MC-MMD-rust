@@ -551,6 +551,7 @@ impl MMDPhysics {
             }
         }
         let mut added = 0usize;
+        let mut tuned_joints = 0usize;
         for &(child_rb_idx, child_bone_idx) in &original_kinematic {
             let Some(parent_rb_idx) =
                 nearest_ragdoll_parent(child_bone_idx, bone_parents, &by_bone)
@@ -579,8 +580,13 @@ impl MMDPhysics {
             {
                 constraint.set_linear_lower_limit(0.0, 0.0, 0.0);
                 constraint.set_linear_upper_limit(0.0, 0.0, 0.0);
-                constraint.set_angular_lower_limit(-0.95, -0.95, -0.95);
-                constraint.set_angular_upper_limit(0.95, 0.95, 0.95);
+                // A universal 0.95-radian limit on every axis lets multiple
+                // torso joints accumulate extreme twisting. Keep hips/legs
+                // untouched, but give shoulder girdle, upper arms, neck and
+                // spine anatomically distinct swing/twist envelopes.
+                let limit = ragdoll_angular_limits(&self.rigid_bodies[child_rb_idx].name);
+                constraint.set_angular_lower_limit(-limit.x, -limit.y, -limit.z);
+                constraint.set_angular_upper_limit(limit.x, limit.y, limit.z);
                 for axis in 0..6 {
                     constraint.set_param(BT_CONSTRAINT_STOP_ERP, 0.475, axis);
                 }
@@ -592,6 +598,9 @@ impl MMDPhysics {
                     constraint: Some(constraint),
                 });
                 added += 1;
+                if limit != Vec3::splat(0.95) {
+                    tuned_joints += 1;
+                }
             }
         }
 
@@ -632,8 +641,11 @@ impl MMDPhysics {
                 {
                     joint.set_linear_lower_limit(0.0, 0.0, 0.0);
                     joint.set_linear_upper_limit(0.0, 0.0, 0.0);
-                    joint.set_angular_lower_limit(-0.65, -0.65, -0.65);
-                    joint.set_angular_upper_limit(0.65, 0.65, 0.65);
+                    // Upper and lower torso share a collider-free waist.
+                    // Allow the waist to bend, but strongly limit axial twist.
+                    let limit = Vec3::new(0.48, 0.26, 0.36);
+                    joint.set_angular_lower_limit(-limit.x, -limit.y, -limit.z);
+                    joint.set_angular_upper_limit(limit.x, limit.y, limit.z);
                     for axis in 0..6 {
                         joint.set_param(BT_CONSTRAINT_STOP_ERP, 0.475, axis);
                     }
@@ -671,8 +683,8 @@ impl MMDPhysics {
 
         self.prev_model_position = None;
         log::info!(
-            "[MMD ragdoll] {} core bodies dynamic, {} anatomical constraints, {} root bridges, control root={:?}, floor={}",
-            original_kinematic.len(), added, root_bridges,
+            "[MMD ragdoll] {} core bodies dynamic, {} anatomical constraints ({} tuned), {} root bridges, control root={:?}, floor={}",
+            original_kinematic.len(), added, tuned_joints, root_bridges,
             self.ragdoll_root_anchor.as_ref().map(|&(bone, _, _)| bone),
             self.ragdoll_floor_body.is_some()
         );
@@ -1025,6 +1037,45 @@ fn terrain_box_pose(bounds: &[f32], yaw: f32, scale: f32) -> Option<(Vec3, Mat4)
     Some((half, transform))
 }
 
+/// Approximate MMD humanoid joint motion envelopes, in radians about the
+/// death-pose constraint frame. Most PMX rigs use Japanese anatomical names;
+/// cover common English equivalents without imposing a humanoid layout on
+/// unrecognized accessory / tail bones.
+///
+/// The original uniform +/-0.95 on every axis allowed two spine joints plus
+/// the pelvis bridge to twist by well over 90 degrees in combination. Arms
+/// need wide swing but substantially less axial twist; shoulders should not
+/// contribute a second unrestricted ball joint before the upper arm.
+fn ragdoll_angular_limits(body_name: &str) -> Vec3 {
+    let name = body_name.to_ascii_lowercase();
+    if body_name.contains("上半身")
+        || name.contains("spine")
+        || name.contains("upperbody")
+        || name.contains("upper_body")
+        || name.contains("torso")
+    {
+        Vec3::new(0.40, 0.25, 0.32)
+    } else if body_name.contains("肩") || name.contains("shoulder") {
+        // Shoulder girdle (scapula/clavicle): limited additional twist.
+        Vec3::new(0.42, 0.43, 0.40)
+    } else if body_name.contains("腕捩") || name.contains("armtwist") {
+        Vec3::new(0.25, 0.25, 0.25)
+    } else if body_name.contains("腕") || name.contains("upperarm")
+        || name.contains("upper_arm") || name == "leftarm" || name == "rightarm"
+    {
+        // MMD arms extend along the local X axis in the bind pose: limit
+        // longitudinal twist while keeping free forward/sideways swing.
+        Vec3::new(0.33, 1.05, 1.10)
+    } else if body_name.contains("首") || name.contains("neck") {
+        Vec3::new(0.44, 0.42, 0.40)
+    } else if body_name == "頭" || name == "head" {
+        Vec3::new(0.48, 0.48, 0.45)
+    } else {
+        // Legs, tails, ears and nonstandard rigs keep Stage 7 behaviour.
+        Vec3::splat(0.95)
+    }
+}
+
 /// Walk the PMX hierarchy, ignoring intermediary bones with no collision body.
 fn nearest_ragdoll_parent(
     child_bone: usize,
@@ -1093,6 +1144,21 @@ fn common_ancestor(a: usize, b: usize, parents: &[i32]) -> Option<usize> {
 #[cfg(test)]
 mod ragdoll_tests {
     use super::*;
+
+    #[test]
+    fn shoulder_and_spine_have_distinct_limits_in_standard_pmx_rigs() {
+        let torso = ragdoll_angular_limits("上半身2");
+        let left_shoulder = ragdoll_angular_limits("左肩");
+        let right_arm = ragdoll_angular_limits("右腕");
+        let leg = ragdoll_angular_limits("左足");
+        assert!(torso.y < 0.3, "spine should resist excessive axial twist");
+        assert!(left_shoulder.z < right_arm.z, "clavicle is not a full ball joint");
+        assert!(right_arm.x < right_arm.y, "limit upper-arm longitudinal twisting");
+        assert_eq!(leg, Vec3::splat(0.95), "preserve the stable leg behaviour");
+        assert_eq!(ragdoll_angular_limits("UpperBody"), torso);
+        assert_eq!(ragdoll_angular_limits("LeftShoulder"), left_shoulder);
+        assert_eq!(ragdoll_angular_limits("RightArm"), right_arm);
+    }
 
     #[test]
     fn pelvis_without_rigid_body_still_connects_two_anatomical_roots() {
